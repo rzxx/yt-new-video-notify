@@ -1,6 +1,10 @@
 {
-  "channel_url": "https://www.youtube.com/@YouTube",
-  "poll_interval_seconds": 30,
-  "heartbeat_interval_seconds": 300,
-  "skip_shorts": true
+  "channels": [
+    {
+      "channel_url": "https://www.youtube.com/@YouTube",
+      "poll_interval_seconds": 30,
+      "skip_shorts": true
+    }
+  ],
+  "heartbeat_interval_seconds": 300
 }

@@ -21,9 +21,11 @@ import (
 )
 
 const (
-	defaultConfigPath  = "config.json"
-	defaultStatePath   = "state.json"
-	defaultPollSeconds = 30
+	defaultConfigPath       = "config.json"
+	defaultStatePath        = "state.json"
+	defaultPollSeconds      = 30
+	defaultHeartbeatSeconds = 300
+	schedulerTickInterval   = time.Second
 )
 
 var (
@@ -41,19 +43,36 @@ var (
 )
 
 type Config struct {
+	Channels          []ChannelConfig `json:"channels"`
+	HeartbeatSeconds  int             `json:"heartbeat_interval_seconds"`
+	LegacyChannelURL  string          `json:"channel_url"`
+	LegacyPollSeconds int             `json:"poll_interval_seconds"`
+	LegacySkipShorts  bool            `json:"skip_shorts"`
+}
+
+type ChannelConfig struct {
 	ChannelURL          string `json:"channel_url"`
 	PollIntervalSeconds int    `json:"poll_interval_seconds"`
-	HeartbeatSeconds    int    `json:"heartbeat_interval_seconds"`
 	SkipShorts          bool   `json:"skip_shorts"`
 }
 
 type State struct {
+	Channels []ChannelState `json:"channels"`
+}
+
+type ChannelState struct {
 	ChannelID     string `json:"channel_id"`
 	ChannelURL    string `json:"channel_url"`
 	LastVideoID   string `json:"last_video_id"`
 	LastVideoURL  string `json:"last_video_url"`
 	LastVideoName string `json:"last_video_name"`
 	LastCheckedAt string `json:"last_checked_at"`
+}
+
+type channelTracker struct {
+	Config    ChannelConfig
+	Interval  time.Duration
+	NextCheck time.Time
 }
 
 type Feed struct {
@@ -88,35 +107,41 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	if cfg.PollIntervalSeconds <= 0 {
-		cfg.PollIntervalSeconds = defaultPollSeconds
-	}
-	if cfg.HeartbeatSeconds <= 0 {
-		cfg.HeartbeatSeconds = 300
-	}
-
 	state, err := loadState(*statePath)
 	if err != nil {
 		log.Fatalf("load state: %v", err)
 	}
 
-	interval := time.Duration(cfg.PollIntervalSeconds) * time.Second
-	heartbeatInterval := time.Duration(cfg.HeartbeatSeconds) * time.Second
-	log.Printf("starting yt-new-video-notify for %s", cfg.ChannelURL)
+	trackers := make([]channelTracker, 0, len(cfg.Channels))
+	log.Printf("starting yt-new-video-notify")
 	log.Printf("yt-new-video-notify is running")
-	log.Printf("watching %s every %s", cfg.ChannelURL, interval)
-	log.Printf("heartbeat every %s", heartbeatInterval)
-	log.Printf("initial check started")
+	log.Printf("tracking %d channel(s)", len(cfg.Channels))
+	for _, channelCfg := range cfg.Channels {
+		interval := time.Duration(channelCfg.PollIntervalSeconds) * time.Second
+		log.Printf("watching %s every %s", channelCfg.ChannelURL, interval)
+		trackers = append(trackers, channelTracker{
+			Config:    channelCfg,
+			Interval:  interval,
+			NextCheck: time.Now(),
+		})
+	}
 
-	if err := runCheck(cfg, state, *statePath); err != nil {
-		log.Printf("check failed: %v", err)
+	heartbeatInterval := time.Duration(cfg.HeartbeatSeconds) * time.Second
+	log.Printf("heartbeat every %s", heartbeatInterval)
+	log.Printf("initial checks started")
+
+	for i := range trackers {
+		if err := runCheck(trackers[i].Config, state, *statePath); err != nil {
+			log.Printf("check failed for %s: %v", trackers[i].Config.ChannelURL, err)
+		}
+		trackers[i].NextCheck = time.Now().Add(trackers[i].Interval)
 	}
 
 	if *runOnce {
 		return
 	}
 
-	pollTicker := time.NewTicker(interval)
+	pollTicker := time.NewTicker(schedulerTickInterval)
 	defer pollTicker.Stop()
 
 	heartbeatTicker := time.NewTicker(heartbeatInterval)
@@ -124,9 +149,16 @@ func main() {
 
 	for {
 		select {
-		case <-pollTicker.C:
-			if err := runCheck(cfg, state, *statePath); err != nil {
-				log.Printf("check failed: %v", err)
+		case now := <-pollTicker.C:
+			for i := range trackers {
+				if trackers[i].NextCheck.After(now) {
+					continue
+				}
+
+				if err := runCheck(trackers[i].Config, state, *statePath); err != nil {
+					log.Printf("check failed for %s: %v", trackers[i].Config.ChannelURL, err)
+				}
+				trackers[i].NextCheck = time.Now().Add(trackers[i].Interval)
 			}
 		case <-heartbeatTicker.C:
 			logHeartbeat(state, cfg)
@@ -135,22 +167,27 @@ func main() {
 }
 
 func logHeartbeat(state *State, cfg Config) {
-	lastSeen := "not set yet"
-	if state.LastVideoName != "" {
-		lastSeen = state.LastVideoName
-	}
+	log.Printf("heartbeat: tracking %d channel(s)", len(cfg.Channels))
+	for _, channelCfg := range cfg.Channels {
+		channelState := state.findChannelState(channelCfg.ChannelURL)
 
-	lastChecked := "not checked yet"
-	if state.LastCheckedAt != "" {
-		lastChecked = state.LastCheckedAt
-	}
+		lastSeen := "not set yet"
+		if channelState != nil && channelState.LastVideoName != "" {
+			lastSeen = channelState.LastVideoName
+		}
 
-	log.Printf(
-		"heartbeat: watching %s | last seen: %s | last check: %s",
-		cfg.ChannelURL,
-		lastSeen,
-		lastChecked,
-	)
+		lastChecked := "not checked yet"
+		if channelState != nil && channelState.LastCheckedAt != "" {
+			lastChecked = channelState.LastCheckedAt
+		}
+
+		log.Printf(
+			"heartbeat: watching %s | last seen: %s | last check: %s",
+			channelCfg.ChannelURL,
+			lastSeen,
+			lastChecked,
+		)
+	}
 }
 
 func loadConfig(path string) (Config, error) {
@@ -165,9 +202,39 @@ func loadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 
-	cfg.ChannelURL = strings.TrimSpace(cfg.ChannelURL)
-	if cfg.ChannelURL == "" {
-		return cfg, errors.New("channel_url is required")
+	if len(cfg.Channels) == 0 && strings.TrimSpace(cfg.LegacyChannelURL) != "" {
+		cfg.Channels = []ChannelConfig{
+			{
+				ChannelURL:          cfg.LegacyChannelURL,
+				PollIntervalSeconds: cfg.LegacyPollSeconds,
+				SkipShorts:          cfg.LegacySkipShorts,
+			},
+		}
+	}
+
+	if len(cfg.Channels) == 0 {
+		return cfg, errors.New("channels must contain at least one channel")
+	}
+
+	seen := make(map[string]struct{}, len(cfg.Channels))
+	for i := range cfg.Channels {
+		cfg.Channels[i].ChannelURL = strings.TrimSpace(cfg.Channels[i].ChannelURL)
+		if cfg.Channels[i].ChannelURL == "" {
+			return cfg, fmt.Errorf("channels[%d].channel_url is required", i)
+		}
+		if cfg.Channels[i].PollIntervalSeconds <= 0 {
+			cfg.Channels[i].PollIntervalSeconds = defaultPollSeconds
+		}
+
+		normalized := normalizeURL(cfg.Channels[i].ChannelURL)
+		if _, exists := seen[normalized]; exists {
+			return cfg, fmt.Errorf("duplicate channel_url in config: %s", cfg.Channels[i].ChannelURL)
+		}
+		seen[normalized] = struct{}{}
+	}
+
+	if cfg.HeartbeatSeconds <= 0 {
+		cfg.HeartbeatSeconds = defaultHeartbeatSeconds
 	}
 
 	return cfg, nil
@@ -183,16 +250,22 @@ func loadState(path string) (*State, error) {
 	}
 
 	var state State
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, err
+	if err := json.Unmarshal(data, &state); err == nil && len(state.Channels) > 0 {
+		return &state, nil
 	}
 
-	return &state, nil
+	var legacy ChannelState
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return nil, err
+	}
+	if legacy.ChannelURL == "" && legacy.ChannelID == "" && legacy.LastVideoID == "" {
+		return &State{}, nil
+	}
+
+	return &State{Channels: []ChannelState{legacy}}, nil
 }
 
 func saveState(path string, state *State) error {
-	state.LastCheckedAt = time.Now().Format(time.RFC3339)
-
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
@@ -201,11 +274,45 @@ func saveState(path string, state *State) error {
 	return os.WriteFile(path, append(data, '\n'), 0o644)
 }
 
-func runCheck(cfg Config, state *State, statePath string) error {
+func (s *State) ensureChannelState(channelURL string) *ChannelState {
+	if s == nil {
+		return nil
+	}
+
+	for i := range s.Channels {
+		if sameChannelURL(s.Channels[i].ChannelURL, channelURL) {
+			return &s.Channels[i]
+		}
+	}
+
+	s.Channels = append(s.Channels, ChannelState{ChannelURL: channelURL})
+	return &s.Channels[len(s.Channels)-1]
+}
+
+func (s *State) findChannelState(channelURL string) *ChannelState {
+	if s == nil {
+		return nil
+	}
+
+	for i := range s.Channels {
+		if sameChannelURL(s.Channels[i].ChannelURL, channelURL) {
+			return &s.Channels[i]
+		}
+	}
+
+	return nil
+}
+
+func runCheck(cfg ChannelConfig, state *State, statePath string) error {
+	channelState := state.ensureChannelState(cfg.ChannelURL)
+	if channelState == nil {
+		return errors.New("could not create channel state")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	channelID, err := effectiveChannelID(ctx, cfg, state)
+	channelID, err := effectiveChannelID(ctx, cfg, channelState)
 	if err != nil {
 		return err
 	}
@@ -218,21 +325,22 @@ func runCheck(cfg Config, state *State, statePath string) error {
 		return errors.New("feed is empty")
 	}
 
-	if state.ChannelID != "" && state.ChannelID != channelID {
-		log.Printf("channel changed from %s to %s, resetting baseline", state.ChannelID, channelID)
-		*state = State{}
+	if channelState.ChannelID != "" && channelState.ChannelID != channelID {
+		log.Printf("channel changed from %s to %s for %s, resetting baseline", channelState.ChannelID, channelID, cfg.ChannelURL)
+		*channelState = ChannelState{ChannelURL: cfg.ChannelURL}
 	}
 
 	relevantEntries := filterFeedEntries(feed.Entries, cfg.SkipShorts)
 	if len(relevantEntries) == 0 {
-		state.ChannelID = channelID
-		state.ChannelURL = cfg.ChannelURL
+		channelState.ChannelID = channelID
+		channelState.ChannelURL = cfg.ChannelURL
+		channelState.LastCheckedAt = time.Now().Format(time.RFC3339)
 		if err := saveState(statePath, state); err != nil {
 			return fmt.Errorf("save state: %w", err)
 		}
 
 		if cfg.SkipShorts {
-			log.Printf("no non-short uploads found in feed; skipping notification check")
+			log.Printf("no non-short uploads found in feed for %s; skipping notification check", cfg.ChannelURL)
 		}
 		return nil
 	}
@@ -242,49 +350,53 @@ func runCheck(cfg Config, state *State, statePath string) error {
 		return errors.New("latest feed entry is missing a video ID")
 	}
 
-	if state.LastVideoID == "" {
-		updateStateFromEntry(state, cfg.ChannelURL, channelID, latest)
+	if channelState.LastVideoID == "" {
+		updateStateFromEntry(channelState, cfg.ChannelURL, channelID, latest)
+		channelState.LastCheckedAt = time.Now().Format(time.RFC3339)
 		if err := saveState(statePath, state); err != nil {
 			return fmt.Errorf("save initial state: %w", err)
 		}
 
-		log.Printf("baseline set to current latest video: %s", latest.Title)
+		log.Printf("baseline set for %s to current latest video: %s", cfg.ChannelURL, latest.Title)
 		return nil
 	}
 
-	if cfg.SkipShorts && stateTracksShort(state, feed.Entries) {
-		updateStateFromEntry(state, cfg.ChannelURL, channelID, latest)
+	if cfg.SkipShorts && stateTracksShort(channelState, feed.Entries) {
+		updateStateFromEntry(channelState, cfg.ChannelURL, channelID, latest)
+		channelState.LastCheckedAt = time.Now().Format(time.RFC3339)
 		if err := saveState(statePath, state); err != nil {
 			return fmt.Errorf("save state after shorts baseline update: %w", err)
 		}
 
-		log.Printf("baseline moved from stored short to latest non-short upload: %s", latest.Title)
+		log.Printf("baseline moved for %s from stored short to latest non-short upload: %s", cfg.ChannelURL, latest.Title)
 		return nil
 	}
 
-	if latest.VideoID == state.LastVideoID {
-		state.ChannelID = channelID
-		state.ChannelURL = cfg.ChannelURL
+	if latest.VideoID == channelState.LastVideoID {
+		channelState.ChannelID = channelID
+		channelState.ChannelURL = cfg.ChannelURL
+		channelState.LastCheckedAt = time.Now().Format(time.RFC3339)
 		return saveState(statePath, state)
 	}
 
-	newEntries := collectNewEntries(relevantEntries, state.LastVideoID)
+	newEntries := collectNewEntries(relevantEntries, channelState.LastVideoID)
 	if len(newEntries) == 0 {
 		newEntries = []FeedEntry{latest}
 	}
 
 	title, message := buildNotification(feed.Title, newEntries)
-	log.Printf("new upload detected: %s", message)
+	log.Printf("new upload detected for %s: %s", cfg.ChannelURL, message)
 
 	if err := showWindowsNotification(title, message, cfg.ChannelURL); err != nil {
-		log.Printf("notification failed: %v", err)
+		log.Printf("notification failed for %s: %v", cfg.ChannelURL, err)
 	}
 
 	if err := openBrowser(cfg.ChannelURL); err != nil {
-		log.Printf("browser launch failed: %v", err)
+		log.Printf("browser launch failed for %s: %v", cfg.ChannelURL, err)
 	}
 
-	updateStateFromEntry(state, cfg.ChannelURL, channelID, latest)
+	updateStateFromEntry(channelState, cfg.ChannelURL, channelID, latest)
+	channelState.LastCheckedAt = time.Now().Format(time.RFC3339)
 	if err := saveState(statePath, state); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}
@@ -292,7 +404,7 @@ func runCheck(cfg Config, state *State, statePath string) error {
 	return nil
 }
 
-func effectiveChannelID(ctx context.Context, cfg Config, state *State) (string, error) {
+func effectiveChannelID(ctx context.Context, cfg ChannelConfig, state *ChannelState) (string, error) {
 	if sameChannelURL(state.ChannelURL, cfg.ChannelURL) && state.ChannelID != "" {
 		return state.ChannelID, nil
 	}
@@ -300,7 +412,7 @@ func effectiveChannelID(ctx context.Context, cfg Config, state *State) (string, 
 	channelID, err := resolveChannelID(ctx, cfg.ChannelURL)
 	if err != nil {
 		if state.ChannelID != "" && sameChannelURL(state.ChannelURL, cfg.ChannelURL) {
-			log.Printf("channel ID resolve failed, using cached channel ID %s", state.ChannelID)
+			log.Printf("channel ID resolve failed, using cached channel ID %s for %s", state.ChannelID, cfg.ChannelURL)
 			return state.ChannelID, nil
 		}
 		return "", fmt.Errorf("resolve channel ID: %w", err)
@@ -335,7 +447,7 @@ func normalizeURL(raw string) string {
 	return parsed.String()
 }
 
-func updateStateFromEntry(state *State, channelURL, channelID string, entry FeedEntry) {
+func updateStateFromEntry(state *ChannelState, channelURL, channelID string, entry FeedEntry) {
 	state.ChannelID = channelID
 	state.ChannelURL = channelURL
 	state.LastVideoID = entry.VideoID
@@ -374,7 +486,7 @@ func filterFeedEntries(entries []FeedEntry, skipShorts bool) []FeedEntry {
 	return filtered
 }
 
-func stateTracksShort(state *State, entries []FeedEntry) bool {
+func stateTracksShort(state *ChannelState, entries []FeedEntry) bool {
 	if state == nil || state.LastVideoID == "" {
 		return false
 	}
@@ -614,14 +726,6 @@ func xmlEscape(value string) string {
 		">", "&gt;",
 		`"`, "&quot;",
 		"'", "&apos;",
-	)
-	return replacer.Replace(value)
-}
-
-func psDoubleQuoted(value string) string {
-	replacer := strings.NewReplacer(
-		"`", "``",
-		`"`, "`\"",
 	)
 	return replacer.Replace(value)
 }
