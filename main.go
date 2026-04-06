@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -54,6 +55,7 @@ type ChannelConfig struct {
 	ChannelURL          string `json:"channel_url"`
 	PollIntervalSeconds int    `json:"poll_interval_seconds"`
 	SkipShorts          bool   `json:"skip_shorts"`
+	SkipLivestreams     bool   `json:"skip_livestreams"`
 }
 
 type State struct {
@@ -61,12 +63,14 @@ type State struct {
 }
 
 type ChannelState struct {
-	ChannelID     string `json:"channel_id"`
-	ChannelURL    string `json:"channel_url"`
-	LastVideoID   string `json:"last_video_id"`
-	LastVideoURL  string `json:"last_video_url"`
-	LastVideoName string `json:"last_video_name"`
-	LastCheckedAt string `json:"last_checked_at"`
+	ChannelID            string   `json:"channel_id"`
+	ChannelURL           string   `json:"channel_url"`
+	LastVideoID          string   `json:"last_video_id"`
+	LastVideoURL         string   `json:"last_video_url"`
+	LastVideoName        string   `json:"last_video_name"`
+	LastVideoPublishedAt string   `json:"last_video_published_at,omitempty"`
+	RecentVideoIDs       []string `json:"recent_video_ids,omitempty"`
+	LastCheckedAt        string   `json:"last_checked_at"`
 }
 
 type channelTracker struct {
@@ -330,7 +334,7 @@ func runCheck(cfg ChannelConfig, state *State, statePath string) error {
 		*channelState = ChannelState{ChannelURL: cfg.ChannelURL}
 	}
 
-	relevantEntries := filterFeedEntries(feed.Entries, cfg.SkipShorts)
+	relevantEntries := sortFeedEntriesByPublished(filterFeedEntries(feed.Entries, cfg.SkipShorts))
 	if len(relevantEntries) == 0 {
 		channelState.ChannelID = channelID
 		channelState.ChannelURL = cfg.ChannelURL
@@ -351,7 +355,7 @@ func runCheck(cfg ChannelConfig, state *State, statePath string) error {
 	}
 
 	if channelState.LastVideoID == "" {
-		updateStateFromEntry(channelState, cfg.ChannelURL, channelID, latest)
+		updateStateFromEntries(channelState, cfg.ChannelURL, channelID, latest, relevantEntries)
 		channelState.LastCheckedAt = time.Now().Format(time.RFC3339)
 		if err := saveState(statePath, state); err != nil {
 			return fmt.Errorf("save initial state: %w", err)
@@ -362,7 +366,7 @@ func runCheck(cfg ChannelConfig, state *State, statePath string) error {
 	}
 
 	if cfg.SkipShorts && stateTracksShort(channelState, feed.Entries) {
-		updateStateFromEntry(channelState, cfg.ChannelURL, channelID, latest)
+		updateStateFromEntries(channelState, cfg.ChannelURL, channelID, latest, relevantEntries)
 		channelState.LastCheckedAt = time.Now().Format(time.RFC3339)
 		if err := saveState(statePath, state); err != nil {
 			return fmt.Errorf("save state after shorts baseline update: %w", err)
@@ -372,30 +376,43 @@ func runCheck(cfg ChannelConfig, state *State, statePath string) error {
 		return nil
 	}
 
-	if latest.VideoID == channelState.LastVideoID {
+	newEntries := collectNewEntriesSince(relevantEntries, channelState)
+	if len(newEntries) == 0 {
 		channelState.ChannelID = channelID
 		channelState.ChannelURL = cfg.ChannelURL
+		channelState.LastVideoID = latest.VideoID
+		channelState.LastVideoURL = latest.URL()
+		channelState.LastVideoName = latest.Title
+		channelState.LastVideoPublishedAt = latest.Published
+		channelState.RecentVideoIDs = recentVideoIDs(relevantEntries)
 		channelState.LastCheckedAt = time.Now().Format(time.RFC3339)
 		return saveState(statePath, state)
 	}
 
-	newEntries := collectNewEntries(relevantEntries, channelState.LastVideoID)
-	if len(newEntries) == 0 {
-		newEntries = []FeedEntry{latest}
+	notifyEntries := newEntries
+	if cfg.SkipLivestreams {
+		notifyEntries, err = filterLivestreamEntries(ctx, newEntries)
+		if err != nil {
+			return fmt.Errorf("filter livestreams: %w", err)
+		}
 	}
 
-	title, message := buildNotification(feed.Title, newEntries)
-	log.Printf("new upload detected for %s: %s", cfg.ChannelURL, message)
+	if len(notifyEntries) > 0 {
+		title, message := buildNotification(feed.Title, notifyEntries)
+		log.Printf("new upload detected for %s: %s", cfg.ChannelURL, message)
 
-	if err := showWindowsNotification(title, message, cfg.ChannelURL); err != nil {
-		log.Printf("notification failed for %s: %v", cfg.ChannelURL, err)
+		if err := showWindowsNotification(title, message, cfg.ChannelURL); err != nil {
+			log.Printf("notification failed for %s: %v", cfg.ChannelURL, err)
+		}
+
+		if err := openBrowser(cfg.ChannelURL); err != nil {
+			log.Printf("browser launch failed for %s: %v", cfg.ChannelURL, err)
+		}
+	} else if cfg.SkipLivestreams {
+		log.Printf("new entries for %s were livestreams only; advancing baseline without notification", cfg.ChannelURL)
 	}
 
-	if err := openBrowser(cfg.ChannelURL); err != nil {
-		log.Printf("browser launch failed for %s: %v", cfg.ChannelURL, err)
-	}
-
-	updateStateFromEntry(channelState, cfg.ChannelURL, channelID, latest)
+	updateStateFromEntries(channelState, cfg.ChannelURL, channelID, latest, relevantEntries)
 	channelState.LastCheckedAt = time.Now().Format(time.RFC3339)
 	if err := saveState(statePath, state); err != nil {
 		return fmt.Errorf("save state: %w", err)
@@ -447,27 +464,68 @@ func normalizeURL(raw string) string {
 	return parsed.String()
 }
 
-func updateStateFromEntry(state *ChannelState, channelURL, channelID string, entry FeedEntry) {
+func updateStateFromEntries(state *ChannelState, channelURL, channelID string, entry FeedEntry, entries []FeedEntry) {
 	state.ChannelID = channelID
 	state.ChannelURL = channelURL
 	state.LastVideoID = entry.VideoID
 	state.LastVideoURL = entry.URL()
 	state.LastVideoName = entry.Title
+	state.LastVideoPublishedAt = entry.Published
+	state.RecentVideoIDs = recentVideoIDs(entries)
 }
 
-func collectNewEntries(entries []FeedEntry, lastVideoID string) []FeedEntry {
+func collectNewEntriesSince(entries []FeedEntry, state *ChannelState) []FeedEntry {
+	if state == nil {
+		return nil
+	}
+
+	watermark, hasWatermark := parseRFC3339(state.LastVideoPublishedAt)
+	if !hasWatermark && state.LastVideoID != "" {
+		if derived, ok := findEntryByVideoID(entries, state.LastVideoID); ok {
+			watermark, hasWatermark = derived.PublishedAt()
+		}
+	}
+	recent := make(map[string]struct{}, len(state.RecentVideoIDs)+1)
+	for _, videoID := range state.RecentVideoIDs {
+		if videoID == "" {
+			continue
+		}
+		recent[videoID] = struct{}{}
+	}
+	if state.LastVideoID != "" {
+		recent[state.LastVideoID] = struct{}{}
+	}
+
 	var pending []FeedEntry
 	for _, entry := range entries {
 		if entry.VideoID == "" {
 			continue
 		}
-		if entry.VideoID == lastVideoID {
-			break
+
+		if _, seen := recent[entry.VideoID]; seen {
+			continue
 		}
-		pending = append(pending, entry)
+
+		published, ok := entry.PublishedAt()
+		if !ok {
+			continue
+		}
+		if !hasWatermark || published.After(watermark) || published.Equal(watermark) {
+			pending = append(pending, entry)
+		}
 	}
 
 	return pending
+}
+
+func findEntryByVideoID(entries []FeedEntry, videoID string) (FeedEntry, bool) {
+	for _, entry := range entries {
+		if entry.VideoID == videoID {
+			return entry, true
+		}
+	}
+
+	return FeedEntry{}, false
 }
 
 func filterFeedEntries(entries []FeedEntry, skipShorts bool) []FeedEntry {
@@ -504,6 +562,60 @@ func stateTracksShort(state *ChannelState, entries []FeedEntry) bool {
 	return false
 }
 
+func recentVideoIDs(entries []FeedEntry) []string {
+	const maxRecentVideoIDs = 20
+
+	recent := make([]string, 0, min(len(entries), maxRecentVideoIDs))
+	for _, entry := range entries {
+		if entry.VideoID == "" {
+			continue
+		}
+		recent = append(recent, entry.VideoID)
+		if len(recent) == maxRecentVideoIDs {
+			break
+		}
+	}
+
+	return recent
+}
+
+func sortFeedEntriesByPublished(entries []FeedEntry) []FeedEntry {
+	if len(entries) < 2 {
+		return entries
+	}
+
+	sorted := append([]FeedEntry(nil), entries...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		left, leftOK := sorted[i].PublishedAt()
+		right, rightOK := sorted[j].PublishedAt()
+		if leftOK && rightOK && !left.Equal(right) {
+			return left.After(right)
+		}
+		if leftOK != rightOK {
+			return leftOK
+		}
+		return i < j
+	})
+
+	return sorted
+}
+
+func filterLivestreamEntries(ctx context.Context, entries []FeedEntry) ([]FeedEntry, error) {
+	filtered := make([]FeedEntry, 0, len(entries))
+	for _, entry := range entries {
+		isLivestream, err := entry.IsLivestream(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if isLivestream {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+
+	return filtered, nil
+}
+
 func buildNotification(channelName string, entries []FeedEntry) (string, string) {
 	if channelName == "" {
 		channelName = "YouTube channel"
@@ -515,6 +627,19 @@ func buildNotification(channelName string, entries []FeedEntry) (string, string)
 
 	latest := entries[0].Title
 	return fmt.Sprintf("%d new uploads on %s", len(entries), channelName), fmt.Sprintf("Latest: %s", latest)
+}
+
+func parseRFC3339(raw string) (time.Time, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return time.Time{}, false
+	}
+
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	return parsed, true
 }
 
 func resolveChannelID(ctx context.Context, channelURL string) (string, error) {
@@ -630,8 +755,25 @@ func (e FeedEntry) URL() string {
 	return "https://www.youtube.com/watch?v=" + e.VideoID
 }
 
+func (e FeedEntry) PublishedAt() (time.Time, bool) {
+	return parseRFC3339(e.Published)
+}
+
 func (e FeedEntry) IsShort() bool {
 	return isShortURL(e.URL())
+}
+
+func (e FeedEntry) IsLivestream(ctx context.Context) (bool, error) {
+	if e.VideoID == "" {
+		return false, nil
+	}
+
+	body, err := fetchText(ctx, e.URL())
+	if err != nil {
+		return false, err
+	}
+
+	return strings.Contains(body, "liveBroadcastDetails"), nil
 }
 
 func isShortURL(raw string) bool {

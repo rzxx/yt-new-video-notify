@@ -3,7 +3,8 @@
     {
       "channel_url": "https://www.youtube.com/@YouTube",
       "poll_interval_seconds": 30,
-      "skip_shorts": true
+      "skip_shorts": true,
+      "skip_livestreams": true
     }
   ],
   "heartbeat_interval_seconds": 300
